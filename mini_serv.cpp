@@ -5,91 +5,104 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-int id[64 * 1024];
-int max = 0, next_id = 0;
-fd_set active, readyRead, readyWrite;
-char bufRead[42*4096], str[42*4096], bufWrite[42*4097];
-void fatal_error()
-{
+// sprintf - запись текста в массив
+// bind - присваивает адрес (127.0.0.1: port) сокету https://ru.manpages.org/bind/2
+
+int usersID[64 * 1024];
+int maxUserSocket = 0;
+int nextUserID = 0;
+
+char readMessageBuffer[42*4096], writeMessageBuffer[42*4096];
+
+fd_set active, readyRead, readyWrite; // https://ru.manpages.org/fd_set/2
+
+void fatal_error() {
     write(2, "Fatal error\n", 12);
     exit(1);
 }
-void send_all(int es) {
-    for (int i = 0; i <= max; i++)
-        if (FD_ISSET(i, &readyWrite) && i != es)
-            send(i, bufWrite, strlen(bufWrite), 0);
+
+// берет сообщение из буффера и отправляет всем пользователям через сокет, кроме отправителя
+void sendMessageToAllUsers(int currentUserSocket) {
+    for (int i = 0; i <= maxUserSocket; i++)
+        if (FD_ISSET(i, &readyWrite) && i != currentUserSocket)
+            send(i, writeMessageBuffer, strlen(writeMessageBuffer), 0);
 }
-int main(int ac, char **av) {
-    if (ac != 2) {
+
+int main(int argc, char **argv) {
+    if (argc != 2) {
         write(2, "Wrong number of arguments\n", 26);
         exit(1);
     }
-    int port = atoi(av[1]);
-    (void) port;
-
-    bzero(&id, sizeof(id));
-    FD_ZERO(&active);
-
-    int serverSock = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSock < 0)
-        fatal_error();
-
-    max = serverSock;
-    FD_SET(serverSock, &active);
-
+    
+    // считанный порт и адрес
     struct sockaddr_in addr;
     socklen_t addr_len = sizeof(addr);
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = (1 << 24) | 127;
-    addr.sin_port = (port >> 8) | (port << 8);
+    addr.sin_addr.s_addr = htonl(2130706433); // берем из сабджекта
+    addr.sin_port = htons(atoi(argv[1]));
+    
+    // зануление
+    bzero(&usersID, sizeof(usersID));
+    FD_ZERO(&active);
 
-    if ((bind(serverSock, (const struct sockaddr *)&addr, sizeof(addr))) < 0)
+    // открытие сокета, команды гуглить или можно обойтись без них хардкодом
+    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0)
         fatal_error();
-    if (listen(serverSock, 128) < 0)
+
+    maxUserSocket = serverSocket;
+    // установить пользака активным
+    FD_SET(serverSocket, &active);
+
+    if ((bind(serverSocket, (const struct sockaddr *)&addr, sizeof(addr))) < 0)
+        fatal_error();
+    
+    // listen -
+    if (listen(serverSocket, 128) < 0)
         fatal_error();
 
     while (1) {
-        readyRead = readyWrite = active;
-        if (select(max + 1, &readyRead, &readyWrite, NULL, NULL) < 0)
-            continue ;
+        readyRead = readyWrite = active; // это фдшники или сокеты?
+        // select - проверка всех фдшников на готовность
+        if (select(maxUserSocket + 1, &readyRead, &readyWrite, NULL, NULL) < 0)
+            continue; // при первом запуске он выходит тут
 
-        for (int s = 0; s <= max; s++) {
+        for (int socket = 0; socket <= maxUserSocket; socket++) {
+            if (FD_ISSET(socket, &readyRead) && socket == serverSocket) { // находит клиента
+                int userSocket = accept(serverSocket, (struct sockaddr *)&addr, &addr_len);
+                if (userSocket < 0)
+                    continue; // не нашел других клиентов
 
-            if (FD_ISSET(s, &readyRead) && s == serverSock) {
-                int clientSock = accept(serverSock, (struct sockaddr *)&addr, &addr_len);
-                if (clientSock < 0)
-                continue ;
+                maxUserSocket = (userSocket > maxUserSocket) ? userSocket : maxUserSocket;
+                usersID[userSocket] = nextUserID; // записывает номер пользака
+                nextUserID += 1;
+                FD_SET(userSocket, &active);
 
-                max = (clientSock > max) ? clientSock : max;
-                id[clientSock] = next_id++;
-                FD_SET(clientSock, &active);
-
-                sprintf(bufWrite, "server: client %d just arrived\n", id[clientSock]);
-                send_all(clientSock);
-                break ;
+                sprintf(writeMessageBuffer, "server: client %d just arrived\n", usersID[userSocket]);
+                sendMessageToAllUsers(userSocket);
+                break;
             }
 
-            if (FD_ISSET(s, &readyRead) && s != serverSock) {
-
-                int res = recv(s, bufRead, 42*4096, 0);
-
-                if (res <= 0) {
-                    sprintf(bufWrite, "server: client %d just left\n", id[s]);
-                    send_all(s);
-                    FD_CLR(s, &active);
-                    close(s);
-                    break ;
+            // MARK: - чтение сообщения
+            
+            if (FD_ISSET(socket, &readyRead) && socket != serverSocket) {
+                // чтение данных из сокета
+                int readBytes = recv(socket, readMessageBuffer, 42*4096, 0);
+                // если ошибка, пользак отключился
+                if (readBytes <= 0) {
+                    sprintf(writeMessageBuffer, "server: client %d just left\n", usersID[socket]);
+                    sendMessageToAllUsers(socket);
+                    FD_CLR(socket, &active);
+                    close(socket);
+                    break;
                 }
+                
+                // MARK: - получение сообщения
+
                 else {
-                    for (int i = 0, j = 0; i < res; i++, j++) {
-                        str[j] = bufRead[i];
-                        if (str[j] == '\n') {
-                            str[j] = '\0';
-                            sprintf(bufWrite, "client %d: %s\n", id[s], str);
-                            send_all(s);
-                            j = -1;
-                        }
-                    }
+                    readMessageBuffer[readBytes - 1] = 0;
+                    sprintf(writeMessageBuffer, "client %d: %s\n", usersID[socket], readMessageBuffer);
+                    sendMessageToAllUsers(socket);
                 }
             }
         }
